@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -80,6 +81,9 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    # Flags internally-submitted restock orders so the UI can list them separately.
+    # Defaults to False, so the 250 seed orders validate unchanged (no JSON migration).
+    is_restock: Optional[bool] = False
 
 class DemandForecast(BaseModel):
     id: str
@@ -89,6 +93,7 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +124,18 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+
+class CreateOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    budget: Optional[float] = None        # informational; recommendation math is client-side
+    warehouse: Optional[str] = None       # from active FilterBar, may be 'all'
+    category: Optional[str] = None        # from active FilterBar, may be 'all'
 
 # API endpoints
 @app.get("/")
@@ -160,6 +177,66 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.post("/api/orders", response_model=Order, status_code=201)
+def create_order(request: CreateOrderRequest):
+    """Create an internally-submitted restock order.
+
+    NOTE: persistence is in-memory only — the order is appended to the `orders`
+    list and is lost when the server restarts (no write back to orders.json).
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    # Guard against zero/negative quantities or prices, which would otherwise
+    # produce a zero/negative total_value and pollute dashboard aggregates.
+    for item in request.items:
+        if item.quantity <= 0 or item.unit_price < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Each item must have a positive quantity and non-negative unit price",
+            )
+
+    now = datetime.now()
+    # Fixed 14-day standard lead time for restock orders
+    expected = now + timedelta(days=14)
+
+    # Derive the next order number by scanning the live list, so numbering stays
+    # unique across multiple submissions within a single server session.
+    max_num = 0
+    for o in orders:
+        num = o.get("order_number", "")
+        if num.startswith("ORD-2025-"):
+            try:
+                max_num = max(max_num, int(num.split("-")[-1]))
+            except ValueError:
+                pass
+    next_num = max_num + 1
+
+    items = [item.model_dump() for item in request.items]
+    total_value = round(sum(i["quantity"] * i["unit_price"] for i in items), 2)
+
+    # Normalize 'all'/empty filter values to None so the order isn't later hidden
+    # by a specific warehouse/category filter.
+    warehouse = request.warehouse if request.warehouse and request.warehouse != "all" else None
+    category = request.category if request.category and request.category != "all" else None
+
+    new_order = {
+        "id": str(len(orders) + 1),
+        "order_number": f"ORD-2025-{next_num:04d}",
+        "customer": "Internal Restock",
+        "items": items,
+        "status": "Processing",
+        "order_date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_delivery": expected.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": warehouse,
+        "category": category,
+        "is_restock": True,
+    }
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():
